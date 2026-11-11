@@ -2,6 +2,8 @@
 import json
 import os
 import re
+import shutil
+import tempfile
 import urllib.parse
 import urllib.request
 
@@ -55,32 +57,25 @@ _LIBRARY_PARTS = {
 }
 
 
-def remote_target_allowed(path: str) -> str:
-    """远程规则只能指向临时目录或缓存目录。返回错误说明，合法时为空串。"""
+def remote_target_allowed(path: str, environ=None) -> str:
+    """远程规则只能指向用户临时目录或 AppData 下的已知缓存。返回错误说明。"""
     if not isinstance(path, str) or not path.strip():
         return "路径为空"
     if len(path) > 500 or any(ord(char) < 32 for char in path):
         return "路径含有非法字符"
-    raw = path.replace("/", "\\")
-    parts = [part for part in raw.split("\\") if part]
-    lowered = [part.lower() for part in parts]
-    if ".." in lowered:
-        return "路径不能包含 .."
+    syntax = safepath.path_syntax_error(path)
+    if syntax:
+        return syntax
+    lowered = [part.lower() for part in safepath._path_parts(path)]
     if any(part in _LIBRARY_PARTS for part in lowered):
         return "远程规则不能指向文档、桌面或下载"
-    if safepath.is_user_library(path) or safepath.is_user_library(os.path.expandvars(path)):
+    if safepath.is_user_library(path, environ):
         return "远程规则不能指向文档、桌面或下载"
-    name = os.path.basename(raw).lower()
+    name = os.path.basename(str(path).replace("/", "\\")).lower()
     if name in safepath.PASSWORD_FILENAMES or "login data" in name:
         return "远程规则不能删除浏览器密码库"
-    folded = raw.lower()
-    temp_root = folded.startswith("%temp%") or folded.startswith("%tmp%")
-    cache_part = any(part in _CACHE_PARTS for part in lowered)
-    if not temp_root and not cache_part:
-        return "远程规则只能指向临时目录或缓存目录"
-    expanded = os.path.expandvars(path)
-    if safepath.is_system_path(expanded) and "temp" not in lowered and "tmp" not in lowered:
-        return "远程规则不能指向系统目录"
+    if not safepath.under_remote_allowlist(path, environ):
+        return "远程规则只能指向用户临时目录或已知缓存目录"
     return ""
 
 
@@ -157,6 +152,29 @@ def merge_remote(local, remote):
     return merged, added, rejected, ""
 
 
+def _write_atomic(path, document):
+    """先写入临时文件并 fsync，再替换。失败时旧文件保持不动。"""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".rules-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(document, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.path.exists(path):
+            shutil.copy2(path, path + ".bak")
+        os.replace(tmp, path)
+        tmp = ""
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 def update_rules(url=None, opener=None):
     """返回 (新增条数, 总条数, 错误信息或空串)。"""
     config = load_config()
@@ -190,9 +208,7 @@ def update_rules(url=None, opener=None):
     if added == 0 and rejected:
         return 0, len(merged.get("categories") or []), f"没有可合并的规则，已拒绝 {rejected} 条"
     try:
-        with open(RULES_PATH, "w", encoding="utf-8") as handle:
-            json.dump(merged, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
+        _write_atomic(RULES_PATH, merged)
     except Exception as exc:
         return 0, 0, f"写入失败：{exc}"
     message = ""

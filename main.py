@@ -7,8 +7,12 @@ import sys
 import tempfile
 import threading
 import time
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ImportError:
+    tk = None
+    filedialog = messagebox = ttk = None
 
 import categories
 import cleaner
@@ -30,6 +34,11 @@ import shredder
 import utils
 import look
 import windrop
+
+_TkLabel = tk.Label if tk is not None else object
+_TkCanvas = tk.Canvas if tk is not None else object
+_TkFrame = tk.Frame if tk is not None else object
+_TkRoot = tk.Tk if tk is not None else object
 
 if getattr(sys, "frozen", False):
     APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
@@ -82,7 +91,7 @@ def _round_rect(canvas, x1, y1, x2, y2, r, **kwargs):
     return canvas.create_polygon(points, smooth=True, **kwargs)
 
 
-class GreenButton(tk.Label):
+class GreenButton(_TkLabel):
     def __init__(self, master, text, command, width=156, height=48):
         normal = look.button(text, GREEN, width, height)
         hover = look.button(text, GREEN_DARK, width, height)
@@ -94,7 +103,7 @@ class GreenButton(tk.Label):
         self.bind("<Leave>", lambda _e: self.configure(image=self._normal))
 
 
-class IconTile(tk.Canvas):
+class IconTile(_TkCanvas):
     def __init__(self, master, color, symbol, size=34):
         super().__init__(master, width=size, height=size,
                          bg=master.cget("bg"), highlightthickness=0)
@@ -103,7 +112,7 @@ class IconTile(tk.Canvas):
                          font=("Microsoft YaHei UI", 11, "bold"))
 
 
-class Pill(tk.Canvas):
+class Pill(_TkCanvas):
     def __init__(self, master, text, bg, fg="white", height=20):
         width = max(34, int(len(text) * 8.5) + 16)
         super().__init__(master, width=width, height=height,
@@ -113,7 +122,7 @@ class Pill(tk.Canvas):
                          font=("Microsoft YaHei UI", 9, "bold"))
 
 
-class SidebarItem(tk.Frame):
+class SidebarItem(_TkFrame):
     def __init__(self, master, key, label, symbol, color, command):
         super().__init__(master, bg=SIDEBAR_BG, cursor="hand2")
         self.key = key
@@ -150,7 +159,7 @@ class SidebarItem(tk.Frame):
         self.size_label.configure(bg=bg, fg=ORANGE)
 
 
-class App(tk.Tk):
+class App(_TkRoot):
     def __init__(self):
         super().__init__()
         look.bind(self)
@@ -192,6 +201,7 @@ class App(tk.Tk):
         self._dup_running = False
         self._big_running = False
         self._mig_running = False
+        self._stray_scan_running = False
         self._im_running = {"wechat": False, "qq": False}
         self._frag_running = False
         self.jobs = scanjobs.ScanJobs()
@@ -230,6 +240,7 @@ class App(tk.Tk):
         self._build_ui()
         self._show_page("clean")
         self.after(100, self._poll)
+        self.after(800, self._check_stray_dirs)
         if self._screenshot:
             self.scan_complete = True
             self.after(250, self._load_screenshot_demo)
@@ -924,15 +935,19 @@ class App(tk.Tk):
                         width=120, height=132)
         card.grid(row=index // 6, column=index % 6, padx=6, pady=6)
         card.pack_propagate(False)
-        var = tk.BooleanVar(value=item["id"] in self.privacy_selected)
+        selectable = privacy.is_selectable(item)
+        var = tk.BooleanVar(value=selectable and item["id"] in self.privacy_selected)
         self._card_vars.append(var)
+        if not selectable:
+            self.privacy_selected.discard(item["id"])
         art = look.category_icon(item.get("name", "项"), False)
         self._photos.append(art)
         holder = tk.Frame(card, bg=CARD)
         holder.pack(pady=(8, 0))
         tk.Label(holder, image=art, bg=CARD).pack()
-        look.Tick(holder, var, command=lambda i=item["id"], v=var: self._toggle_privacy(i, v.get()),
-                  bg=CARD, size=16).place_over(holder)
+        if selectable:
+            look.Tick(holder, var, command=lambda i=item["id"], v=var: self._toggle_privacy(i, v.get()),
+                      bg=CARD, size=16).place_over(holder)
         tk.Label(card, text=item.get("name", ""), bg=CARD, fg=TEXT,
                  font=look.tk_font(8), wraplength=108, justify="center").pack()
         count = int(item.get("count") or 0)
@@ -1280,15 +1295,24 @@ class App(tk.Tk):
         self._mig_running = True
 
         def work():
-            ok, errors = [], []
+            ok, errors, backups = [], [], []
             for path in paths:
                 try:
-                    migrate.migrate_file(path, dest)
-                    ok.append(path)
+                    result = migrate.migrate_file(path, dest)
+                    if result.ok:
+                        ok.append(path)
+                    else:
+                        errors.append(f"{os.path.basename(path)}：{result.warning}")
+                        if result.backup:
+                            backups.append(result.backup)
                 except Exception as exc:
                     errors.append(f"{os.path.basename(path)}：{exc}")
+                    backup = path + ".migrate-bak"
+                    if os.path.lexists(backup):
+                        backups.append(backup)
             self._mig_running = False
-            self.queue.put(("bigmove_done", ok, errors))
+            self.queue.put(("bigmove_done", ok, errors, dest,
+                            list(dict.fromkeys(backups))))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1889,20 +1913,15 @@ class App(tk.Tk):
         threading.Thread(target=self._shred_worker, args=(paths,), daemon=True).start()
 
     def _shred_worker(self, paths):
-        done = []
-        for path in paths:
-            try:
-                shredder.shred_path(path)
-                done.append(path)
-            except Exception:
-                continue
-        if done:
-            try:
-                history.append_shred_history(LOG_DIR, done)
-            except OSError:
-                pass
+        records = shredder.run_batch(paths)
+        try:
+            history.append_shred_history(LOG_DIR, records)
+        except OSError:
+            pass
+        done = [item["path"] for item in records if item.get("status") == "ok"]
+        failed = [item for item in records if item.get("status") != "ok"]
         self._cleaning = False
-        self.queue.put(("shred_done", done))
+        self.queue.put(("shred_done", done, failed))
 
     def _show_shred_history(self):
         rows = history.load_shred_history(LOG_DIR)
@@ -1947,21 +1966,19 @@ class App(tk.Tk):
 
     # ---------- 动作 ----------
     def start_scan(self):
-        if self._scanning:
-            return
+        gen = self.jobs.start("clean")
         self.scan_complete = False
         self._scanning = True
-        threading.Thread(target=self._scan_worker, daemon=True).start()
+        threading.Thread(target=self._scan_worker, args=(gen,), daemon=True).start()
 
-    def _scan_worker(self):
+    def _scan_worker(self, gen):
         for cat in self.categories:
             try:
                 size, count = scanner.scan_category(cat)
             except Exception:
                 size, count = -1, 0
-            self.queue.put(("scanned", cat.key, size, count))
-        self._scanning = False
-        self.queue.put(("scan_done",))
+            self.queue.put(("scanned", gen, cat.key, size, count))
+        self.queue.put(("scan_done", gen))
 
     def start_clean(self):
         if not self.scan_complete:
@@ -2003,17 +2020,20 @@ class App(tk.Tk):
     def _clean_worker(self, chosen):
         lines = ["开始清理"]
         freed = 0
+        errors = []
         for cat in chosen:
             try:
                 result = cleaner.clean_category(cat, log=lines.append)
                 freed += result.freed
+                errors.extend(result.errors)
                 lines.append(f"清理：{cat.name}")
             except Exception as exc:
+                errors.append(f"{cat.name}：{exc}")
                 lines.append(f"清理失败：{cat.name} {exc}")
         lines.append(f"清理结束，共释放 {utils.fmt_size(freed)}")
         self._write_clean_log(lines)
         self._cleaning = False
-        self.queue.put(("clean_done", freed))
+        self.queue.put(("clean_done", freed, errors))
 
     def _run_defrag(self):
         if self._cleaning:
@@ -2096,9 +2116,12 @@ class App(tk.Tk):
 
     def _mig_worker(self, src, dest):
         try:
-            migrate.migrate(src, dest)
+            result = migrate.migrate(src, dest)
             self._mig_running = False
-            self.queue.put(("mig_done", True, src))
+            if result.ok:
+                self.queue.put(("mig_done", True, src))
+            else:
+                self.queue.put(("mig_done", "partial", result))
         except Exception as exc:
             self._mig_running = False
             self.queue.put(("mig_done", False, str(exc)))
@@ -2122,12 +2145,98 @@ class App(tk.Tk):
 
     def _mig_undo_worker(self, src):
         try:
-            migrate.undo(src)
+            result = migrate.undo(src)
             self._mig_running = False
-            self.queue.put(("mig_done", True, src))
+            if result.ok:
+                self.queue.put(("mig_done", True, src))
+            else:
+                self.queue.put(("mig_done", "partial", result))
         except Exception as exc:
             self._mig_running = False
             self.queue.put(("mig_done", False, str(exc)))
+
+    def _check_stray_dirs(self):
+        if self._screenshot:
+            return
+        if not self._stray_scan_running:
+            self._stray_scan_running = True
+            threading.Thread(target=self._scan_stray_dirs, daemon=True).start()
+        self.after(300000, self._check_stray_dirs)
+
+    def _scan_stray_dirs(self):
+        try:
+            found = migrate.find_stray_dirs(migrate.known_locations(), max_depth=None)
+        except Exception:
+            found = []
+        self.queue.put(("stray_dirs", found))
+
+    def _handle_bigmove_done(self, message):
+        ok, errors = message[1], message[2]
+        dest = message[3] if len(message) > 3 else ""
+        backups = list(message[4] or []) if len(message) > 4 else []
+        if errors:
+            backup = backups[0] if backups else ""
+            remaining = backups[1:] + errors
+            self._show_warning_panel(
+                "搬家未完成",
+                f"已完成 {len(ok)} 个。以下没有按成功处理：",
+                backup, remaining,
+                migrate.find_stray_dirs([dest] if dest else [], max_depth=2))
+        else:
+            messagebox.showinfo("搬家结果", f"已搬家 {len(ok)} 个文件。")
+        self.start_bigmove_scan()
+
+    def _show_warning_panel(self, title, summary, backup, remaining, quarantine=()):
+        text = migrate.partial_report(backup, remaining, quarantine)
+        if summary:
+            text = summary + ("\n\n" + text if text else "")
+        candidates = [backup, *(remaining or []), *(quarantine or [])]
+        open_path = ""
+        for candidate in candidates:
+            if not candidate:
+                continue
+            if os.path.lexists(str(candidate)):
+                open_path = str(candidate)
+                break
+        if not open_path:
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                folder = os.path.dirname(str(candidate))
+                if folder and os.path.isdir(folder):
+                    open_path = folder
+                    break
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.configure(bg=WHITE)
+        win.geometry("560x420")
+        tk.Label(win, text=title, bg=WHITE, fg=TEXT,
+                 font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w", padx=16, pady=(14, 6))
+        box = tk.Text(win, height=14, wrap="word", bg="#f7fbfe", fg=TEXT,
+                      relief="flat", font=("Microsoft YaHei UI", 10))
+        box.pack(fill="both", expand=True, padx=16, pady=6)
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+
+        def open_it():
+            migrate.open_folder(open_path)
+
+        bar = tk.Frame(win, bg=WHITE)
+        bar.pack(fill="x", padx=16, pady=12)
+        tk.Button(bar, text="打开文件夹", command=open_it, bg="#23d6a0", fg="white",
+                  relief="flat", padx=12, pady=4).pack(side="left")
+        tk.Button(bar, text="知道了", command=win.destroy, bg="#e8eef5", fg=TEXT,
+                  relief="flat", padx=12, pady=4).pack(side="right")
+        win.transient(self)
+        win.grab_set()
+        win.update_idletasks()
+        width = win.winfo_width()
+        height = win.winfo_height()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - width) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - height) // 2)
+        win.geometry(f"+{x}+{y}")
+        win.lift()
+        return win
 
     def _check_rules_update(self):
         def work():
@@ -2152,11 +2261,16 @@ class App(tk.Tk):
     def _handle(self, message):
         kind = message[0]
         if kind == "scanned":
-            _, key, size, count = message
+            _, gen, key, size, count = message
+            if not self.jobs.accept("clean", gen):
+                return
             self.results[key] = (size, count)
             self._update_clean_head()
             self._update_sidebar_sizes()
         elif kind == "scan_done":
+            if not self.jobs.accept("clean", message[1]):
+                return
+            self._scanning = False
             self.worker = None
             self.scan_complete = True
             self._refresh_clean_cards()
@@ -2165,7 +2279,15 @@ class App(tk.Tk):
         elif kind == "clean_done":
             self.worker = None
             self._draw_disk_bar()
-            messagebox.showinfo("清理完成", f"本次释放 {utils.fmt_size(message[1])}")
+            freed = message[1]
+            errors = message[2] if len(message) > 2 else []
+            if errors:
+                self._show_warning_panel(
+                    "清理未全部完成",
+                    f"已释放 {utils.fmt_size(freed)}。以下项目未能安全删除：",
+                    "", errors, [])
+            else:
+                messagebox.showinfo("清理完成", f"本次释放 {utils.fmt_size(freed)}")
             self.start_scan()
         elif kind == "big_progress":
             if self.jobs.accept("big", message[1]):
@@ -2219,12 +2341,15 @@ class App(tk.Tk):
             self.bigmove_rows = message[2]
             self._render_bigmove()
         elif kind == "bigmove_done":
-            ok, errors = message[1], message[2]
-            text = f"已搬家 {len(ok)} 个文件。"
-            if errors:
-                text += "\n" + "\n".join(errors[:8])
-            messagebox.showinfo("搬家结果", text)
-            self.start_bigmove_scan()
+            self._handle_bigmove_done(message)
+        elif kind == "stray_dirs":
+            self._stray_scan_running = False
+            found = message[1]
+            if found:
+                self._show_warning_panel(
+                    "发现未清理的搬家备份",
+                    "这些路径不会自动删除。请确认里面没有需要保留的文件。",
+                    "", found, found)
         elif kind == "privacy_progress":
             self.privacy_step = message[1]
             self.privacy_records = message[2]
@@ -2252,8 +2377,21 @@ class App(tk.Tk):
             self._render_mig(message[1])
         elif kind == "mig_done":
             self.worker = None
-            if message[1]:
+            if message[1] is True:
                 messagebox.showinfo("完成", f"已处理：{message[2]}")
+                self.start_migrate_scan()
+            elif message[1] == "partial":
+                result = message[2]
+                warning = result.warning if hasattr(result, "warning") else str(result)
+                backup = getattr(result, "backup", "") or ""
+                remaining = list(getattr(result, "remaining", ()) or [])
+                nearby = []
+                if backup:
+                    nearby.append(backup if os.path.isdir(backup) else os.path.dirname(backup))
+                nearby.extend(os.path.dirname(item) if item and not os.path.isdir(str(item)) else item
+                              for item in remaining)
+                quarantine = migrate.find_stray_dirs([item for item in nearby if item], max_depth=2)
+                self._show_warning_panel("迁移未完成", warning, backup, remaining, quarantine)
                 self.start_migrate_scan()
             else:
                 messagebox.showerror("失败", message[2])
@@ -2444,6 +2582,8 @@ class App(tk.Tk):
         self.scan_complete = True
 
 def main():
+    if tk is None:
+        raise RuntimeError("图形界面需要 Python tkinter 组件；当前环境未提供该组件。")
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:

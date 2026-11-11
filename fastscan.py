@@ -74,6 +74,8 @@ def _run_mft(exe, root, skip_top, min_size, force=False):
 
 def iter_files_parallel(root, workers=8, skip_top=None, min_size=0):
     """返回 [(path, size), ...]。失败时返回 None，调用方可回退到串行扫描。"""
+    if _linked_root(root):
+        return []
     if not os.path.isdir(root):
         return None
     skip_top = {name.lower() for name in (skip_top or ())}
@@ -131,8 +133,20 @@ def iter_files_parallel(root, workers=8, skip_top=None, min_size=0):
     return results
 
 
+def _linked_root(root) -> bool:
+    if not root or os.path.islink(root):
+        return True
+    try:
+        import safepath
+        return safepath.is_reparse_point(root)
+    except Exception:
+        return True
+
+
 def iter_files(root, skip_top=None, min_size=0, force=False):
     """按场景选择：整盘/大文件扫描用 MFT，小目录用并行遍历，最后串行。"""
+    if _linked_root(root):
+        return []
     exe = _mft_exe()
     drive_part = os.path.splitdrive(os.path.abspath(root))[1]
     use_mft = bool(exe) and (drive_part in ("\\", "") or min_size >= 10 * 1024 * 1024)

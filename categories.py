@@ -28,6 +28,7 @@ class Category:
     requires_confirm: bool = False
     prune_dirs: bool = False
     size_fn: object = None
+    untrusted: bool = False
 
 
 def _env(*parts) -> str:
@@ -107,6 +108,7 @@ def _load_external_rules():
             warning=item.get("warning", ""),
             requires_confirm=bool(item.get("requires_confirm", False)),
             prune_dirs=bool(item.get("prune_dirs", False)),
+            untrusted=True,
         ))
     return cats
 

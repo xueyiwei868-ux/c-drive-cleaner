@@ -36,7 +36,14 @@ def append_shred_history(log_dir, paths):
     moment = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(path, "a", encoding="utf-8") as handle:
         for item in paths or []:
-            handle.write(f"{moment}\t{item}\n")
+            if isinstance(item, str):
+                status, target = "ok", item
+            else:
+                status = item.get("status") or "ok"
+                target = item.get("path") or ""
+            handle.write(f"{moment}\t{status}\t{target}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     return path
 
 
@@ -51,11 +58,15 @@ def load_shred_history(log_dir):
                 line = line.rstrip("\n")
                 if not line:
                     continue
-                if "\t" in line:
-                    moment, item = line.split("\t", 1)
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    moment, status, item = parts[0], parts[1], parts[2]
+                elif len(parts) == 2:
+                    moment, item = parts
+                    status = "ok"
                 else:
-                    moment, item = "", line
-                rows.append({"time": moment, "path": item})
+                    moment, status, item = "", "ok", line
+                rows.append({"time": moment, "status": status, "path": item})
     except OSError:
         return []
     rows.reverse()

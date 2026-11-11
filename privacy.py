@@ -579,10 +579,27 @@ def scan(progress=None):
     return records
 
 
+def is_selectable(record) -> bool:
+    """没有实际清理动作的统计项不能勾选。"""
+    if not isinstance(record, dict):
+        return False
+    action = record.get("action")
+    if action == "sql":
+        return bool(record.get("sql_jobs"))
+    if action == "registry":
+        return True
+    if action in ("userassist", "ie", "media", "wmp"):
+        return True
+    if action == "files":
+        return bool(record.get("files"))
+    return False
+
+
 def clean_plan(records, selected_ids):
     """算出要动哪些文件、哪些 SQL、哪些注册表组。密码库会被丢掉。"""
     by_id = {item["id"]: item for item in records or []}
-    selected = [by_id[key] for key in selected_ids or [] if key in by_id]
+    selected = [by_id[key] for key in selected_ids or []
+                if key in by_id and is_selectable(by_id[key])]
     wiped = {item.get("browser") for item in selected if item.get("section") == "history"}
     files = []
     jobs = []
